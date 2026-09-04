@@ -47,7 +47,9 @@ Inbound decoders (each forwards decoded messages to the next handler):
   (`offset`, `length`, optional `ByteOrder` and `maxLength`; little-endian by default).
   Handles both sticky packets and half packets.
 - `DelimiterBasedDecoder` - splits by a single **ASCII** delimiter (the delimiter is stripped).
-- `LineBasedDecoder` - a `DelimiterBasedDecoder` that splits on `\n`.
+- `LineBasedDecoder` - a dedicated newline-framing decoder that strips either `\n` or `\r\n`
+  (an optional `maxFrameLength` guards against oversized lines). It buffers partial lines across
+  reads and emits every frame as a `byte[]`.
 - `StringDecoder` - converts `byte[]` / heap `ByteBuffer` into `String`
   (UTF-8 by default, charset configurable).
 
@@ -201,6 +203,9 @@ mvn -Dtest=com.github.skywalker.mininetty.client.PerformanceTest -Dperf.clients=
 Reference result of `com.github.skywalker.mininetty.client.PerformanceTest` on the development machine: each client is a raw
 blocking `Socket` that synchronously sends a 32-byte message and reads the echoed reply, so
 throughput is measured as round-trip requests per second (RTT-TPS).
+
+Benchmark environment: **Windows 11 Pro**, AMD Ryzen 5 7500F (6 cores / 12 threads), 32 GB RAM,
+Microsoft OpenJDK 17.0.17 (code compiled for Java 8).
 
 | Scenario | Throughput | Avg | p50 | p90 | p99 | Max |
 | --- | --- | --- | --- | --- | --- | --- |
