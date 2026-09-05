@@ -56,12 +56,8 @@ public abstract class AbstractManager<T extends LifeCycle> implements Manager<T>
     protected abstract T newCandidate();
 
     @Override
-    public T chooseOne(Object param) {
-        return chooseStrategy.choose(param);
+    public T chooseOne() {
+        return chooseStrategy.choose();
     }
 
-    @Override
-    public T chooseOne(Object param, ChooseStrategy.PostAction postAction) {
-        return chooseStrategy.choose(param, postAction);
-    }
 }

@@ -9,16 +9,8 @@ import java.util.List;
  */
 public interface ChooseStrategy<T> {
 
-    T choose(Object param);
-
-    T choose(Object param, PostAction postAction);
+    T choose();
 
     void setCandidates(List<T> candidates);
-
-    enum PostAction {
-        BIND,
-        UNBIND,
-        NOOP
-    }
 
 }

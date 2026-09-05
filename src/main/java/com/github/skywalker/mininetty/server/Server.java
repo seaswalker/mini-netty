@@ -1,24 +1,17 @@
 package com.github.skywalker.mininetty.server;
 
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
-import com.github.skywalker.mininetty.manager.DefaultRoundRobinStrategy;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.github.skywalker.mininetty.exception.MiniNettyIllegalStateException;
+import com.github.skywalker.mininetty.lifecycle.LifeCycleState;
+import com.github.skywalker.mininetty.manager.ManagerGroup;
 
 import com.github.skywalker.mininetty.handler.Handler;
 import com.github.skywalker.mininetty.lifecycle.LifeCycle;
-import com.github.skywalker.mininetty.selector.SelectorManager;
-import com.github.skywalker.mininetty.util.CloseableUtils;
-import com.github.skywalker.mininetty.worker.WorkerManager;
 
 /**
  * Server.
@@ -27,55 +20,18 @@ import com.github.skywalker.mininetty.worker.WorkerManager;
  */
 public final class Server implements LifeCycle {
 
-    // Listen in blocking mode by default
-    private boolean block = true;
-    private ServerSocketChannel serverSocketChannel;
-
-    private volatile boolean closed = false;
-
     private final List<Handler> handlers = new LinkedList<>();
-    private final ExecutorService executor;
-    private final SelectorManager selectorManager;
-    private final WorkerManager workerManager;
-    private final int acceptors;
+    private final ManagerGroup managerGroup;
+    private final LifeCycleState lifeCycleState = new LifeCycleState();
 
-    private final static Logger logger = LoggerFactory.getLogger(Server.class);
+    private int port = -1;
+    private Future<?> future;
 
-    public Server() {
-        this(0, 0);
-    }
-
-    public Server(int acceptors, int workers) {
-        int cores = Runtime.getRuntime().availableProcessors();
-        int max = Math.max(2, Math.min(4, cores / 8));
-        if (acceptors <= 1) {
-            acceptors = max;
+    public Server(ManagerGroup managerGroup) {
+        if (managerGroup == null) {
+            throw new MiniNettyIllegalStateException("ManagerGroup is null");
         }
-        if (workers <= 0) {
-            workers = max;
-        }
-        if (acceptors > cores) {
-            throw new IllegalArgumentException(
-                    "The acceptors count must not exceed the number of cores.");
-        }
-        if (workers > cores) {
-            throw new IllegalArgumentException(
-                    "The workers count must not exceed the number of cores.");
-        }
-        executor = Executors.newFixedThreadPool(acceptors + workers);
-        int selectors = (acceptors /= 2);
-        selectorManager = new SelectorManager(selectors);
-        workerManager = new WorkerManager(workers, new DefaultRoundRobinStrategy<>());
-        this.acceptors = acceptors;
-        selectorManager.setWorkerManager(workerManager);
-    }
-
-    /**
-     * Configures whether the server listens in blocking mode.
-     */
-    public Server configureBlocking(boolean block) {
-        this.block = block;
-        return this;
+        this.managerGroup = managerGroup;
     }
 
     /**
@@ -83,79 +39,65 @@ public final class Server implements LifeCycle {
      */
     public Server bind(int port) {
         if (port < 1)
-            throw new IllegalArgumentException(
+            throw new MiniNettyIllegalStateException(
                     "The port must be greater than 0.");
-        try {
-            serverSocketChannel = ServerSocketChannel.open();
-            serverSocketChannel.socket().setReuseAddress(true);
-            serverSocketChannel.bind(new InetSocketAddress(port));
-            serverSocketChannel.configureBlocking(block);
-        } catch (IOException e) {
-            logger.error("Failed to bind to port {}.", port);
-            System.exit(1);
-        }
+        this.port = port;
         return this;
     }
 
     public Server setHandlers(Handler... handlers) {
         if (handlers.length < 1) {
-            throw new IllegalArgumentException("No handlers specified.");
+            throw new MiniNettyIllegalStateException("No handlers specified");
         }
         this.handlers.addAll(Arrays.asList(handlers));
         return this;
+    }
+
+    @Override
+    public void start() {
+        checkRequires();
+        if (lifeCycleState.start()) {
+            internalStartAsync();
+            try {
+                future.get();
+            } catch (InterruptedException | ExecutionException e) {
+                throw new MiniNettyIllegalStateException(e);
+            }
+        }
     }
 
     /**
      * Starts the server.
      */
     @Override
-    public void start() {
-        if (handlers.isEmpty()) {
-            throw new IllegalArgumentException("No handlers specified.");
+    public Future<?> startAsync() {
+        checkRequires();
+        if (lifeCycleState.start()) {
+            internalStartAsync();
         }
-        workerManager.start();
-        selectorManager.start();
-        for (int i = 0; i < acceptors; i++)
-            executor.execute(new Acceptor());
-        logger.info("Server started successfully.");
+        return future;
     }
 
     @Override
     public void close() {
-        workerManager.close();
-        selectorManager.close();
-
-        executor.shutdown();
-
-        closed = true;
-        CloseableUtils.closeQuietly(serverSocketChannel);
-    }
-
-    /**
-     * Accepts incoming client connections and registers them with a selector.
-     *
-     * @author skywalker
-     */
-    private class Acceptor implements Runnable {
-
-        @Override
-        public void run() {
-            while (true) {
-                try {
-                    SocketChannel channel = serverSocketChannel.accept();
-                    channel.configureBlocking(false);
-                    selectorManager.chooseOne(null).register(channel, handlers);
-                } catch (IOException e) {
-                    if (closed) {
-                        logger.debug("Close method was called, acceptor exiting.");
-                        break;
-                    } else {
-                        logger.debug("Failed to accept a client connection: {}", e.getMessage());
-                    }
-                }
+        if (lifeCycleState.close()) {
+            if (future != null) {
+                future.cancel(true);
             }
         }
+    }
 
+    private void checkRequires() {
+        if (handlers.isEmpty()) {
+            throw new MiniNettyIllegalStateException("No handlers specified");
+        }
+        if (port < 0) {
+            throw new MiniNettyIllegalStateException("No port bound?");
+        }
+    }
+
+    private void internalStartAsync() {
+        this.future = managerGroup.getSelectorManager().chooseOne().registerServerChannelAsync(port, handlers);
     }
 
 }

@@ -12,8 +12,6 @@ public interface Manager<T> extends LifeCycle {
     /**
      * Picks one of the managed threads.
      */
-    T chooseOne(Object param);
-
-    T chooseOne(Object param, ChooseStrategy.PostAction postAction);
+    T chooseOne();
 
 }

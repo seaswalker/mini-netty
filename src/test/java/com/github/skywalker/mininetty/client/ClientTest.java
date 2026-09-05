@@ -65,7 +65,7 @@ public class ClientTest {
     public void testDelimiterBasedDecoder() throws IOException, InterruptedException {
         try (TestSupport.TestServer server = TestSupport.startServer(
                 () -> new Handler[] {
-                        new DelimiterBasedDecoder('a'),
+                        new DelimiterBasedDecoder((byte) 'a'),
                         new StringDecoder(),
                         new ResponseHandler()
                 });

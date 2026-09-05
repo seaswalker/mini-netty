@@ -2,6 +2,7 @@ package com.github.skywalker.mininetty.context;
 
 import java.io.IOException;
 import java.nio.channels.SocketChannel;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import com.github.skywalker.mininetty.handler.*;
@@ -15,13 +16,14 @@ import com.github.skywalker.mininetty.worker.Worker;
  *
  * @author skywalker
  */
-public class ChannelHandlerContext {
+public class ChannelHandlerContext implements FutureAttached {
 
     private final HandlerChain handlerChain;
     private final Worker worker;
     private final SocketChannel channel;
     private final QueuedSelector queuedSelector;
     private final String clientIdentifier;
+    private final CompletableFuture<?> future;
 
     private boolean running = true;
     private boolean writable = true;
@@ -31,12 +33,13 @@ public class ChannelHandlerContext {
     private static final Logger logger = LoggerFactory.getLogger(ChannelHandlerContext.class);
 
     public ChannelHandlerContext(HandlerChain handlerChain, Worker worker, SocketChannel channel,
-                                 QueuedSelector queuedSelector) throws IOException {
+                                 QueuedSelector queuedSelector, CompletableFuture<?> future) throws IOException {
         this.handlerChain = handlerChain;
         this.worker = worker;
         this.channel = channel;
         this.queuedSelector = queuedSelector;
         this.clientIdentifier = channel.getRemoteAddress().toString();
+        this.future = future;
     }
 
     public boolean isRunning() {
@@ -162,6 +165,11 @@ public class ChannelHandlerContext {
 
     public long getLastActiveTime() {
         return lastActiveTime;
+    }
+
+    @Override
+    public CompletableFuture<?> getFuture() {
+        return future;
     }
 
     private void runInWorker(Runnable task) {

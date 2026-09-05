@@ -18,12 +18,7 @@ public abstract class AbstractChooseStrategy<T> implements ChooseStrategy<T> {
     private final Lock lock = new ReentrantLock();
 
     @Override
-    public final T choose(Object param) {
-        return choose(param, PostAction.NOOP);
-    }
-
-    @Override
-    public final T choose(Object param, PostAction postAction) {
+    public final T choose() {
         lock.lock();
         T result;
         try {

@@ -10,6 +10,7 @@ public class LoggingOutboundHandler extends OutBoundHandlerAdapter {
 
     @Override
     public void channelExceptionCaught(MessageProcessingContext context, Exception e) {
-        logger.error("Exception caught in client: {}.", context.channel().getClientIdentifier(), e);
+        logger.error("Exception caught in client: {}, close channel.", context.channel().getClientIdentifier(), e);
+        context.channel().fireChannelInActive();
     }
 }

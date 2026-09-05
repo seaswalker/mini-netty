@@ -17,6 +17,7 @@ import com.github.skywalker.mininetty.handler.codec.decoder.DelimiterBasedDecode
 import com.github.skywalker.mininetty.handler.codec.decoder.StringDecoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.github.skywalker.mininetty.manager.ManagerGroup;
 import com.github.skywalker.mininetty.server.Server;
 
 /**
@@ -42,10 +43,18 @@ public final class TestSupport {
     public static final int READ_TIMEOUT_SECONDS = 10;
     /** Connection timeout. */
     private static final int CONNECT_TIMEOUT_MILLIS = 1000;
-    /** How long to wait for the server to become ready after startup. */
+    /** How long the server is given to start accepting connections. */
     private static final long SERVER_READY_WAIT_SECONDS = 2;
     /** Test port allocator, so each test case/server uses a distinct port. */
     private static final AtomicInteger PORT = new AtomicInteger(8081);
+    /** Selector threads owned by each test manager group. */
+    private static final int SELECTOR_COUNT = 1;
+    /**
+     * Worker threads owned by each test manager group: large enough for the
+     * concurrent-client scenarios to get distinct workers, small enough to keep
+     * the per-test thread footprint low.
+     */
+    private static final int WORKER_COUNT = 4;
 
     private TestSupport() {
     }
@@ -60,14 +69,20 @@ public final class TestSupport {
      */
     public static Handler[] echoLineHandlers() {
         return new Handler[] {
-                new DelimiterBasedDecoder('\n'),
+                new DelimiterBasedDecoder((byte) '\n'),
                 new StringDecoder(),
                 new ResponseHandler()
         };
     }
 
     /**
-     * Starts a server, returns its bound port and waits until it is ready.
+     * Starts a server, returns its bound port and waits until it accepts connections.
+     *
+     * <p>After the refactor the thread pools live in an external {@link ManagerGroup}
+     * that must be started before the {@link Server} can register its channel, so this
+     * method creates and starts a dedicated group per server and lets {@link TestServer}
+     * shut it down again. {@link Server#startAsync()} is used instead of
+     * {@link Server#start()}: the latter blocks until the server is closed.</p>
      *
      * @param handlerFactory a handler factory; it is invoked every time a client
      *                       connection is established (i.e. {@link HandlerInitializer#init()}
@@ -77,16 +92,38 @@ public final class TestSupport {
      */
     public static TestServer startServer(final Supplier<Handler[]> handlerFactory) throws InterruptedException {
         int port = PORT.getAndIncrement();
-        Server server = new Server();
+        ManagerGroup managerGroup = new ManagerGroup(SELECTOR_COUNT, WORKER_COUNT);
+        managerGroup.start();
+        Server server = new Server(managerGroup);
         server.bind(port).setHandlers(new HandlerInitializer() {
             @Override
             public Handler[] init() {
                 return handlerFactory.get();
             }
-        }).start();
+        }).startAsync();
+        awaitAccepting(port);
         log.info("Server started, listening on port {}.", port);
-        TimeUnit.SECONDS.sleep(SERVER_READY_WAIT_SECONDS);
-        return new TestServer(server, port);
+        return new TestServer(server, managerGroup, port);
+    }
+
+    /**
+     * Blocks until the server on the given port accepts a connection (or the readiness
+     * deadline elapses), so tests can connect immediately after {@link #startServer}.
+     */
+    private static void awaitAccepting(int port) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SERVER_READY_WAIT_SECONDS);
+        IOException lastFailure = null;
+        while (System.nanoTime() < deadline) {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress("localhost", port), CONNECT_TIMEOUT_MILLIS);
+                return;
+            } catch (IOException e) {
+                lastFailure = e;
+                TimeUnit.MILLISECONDS.sleep(50);
+            }
+        }
+        throw new IllegalStateException("Server did not accept connections on port " + port
+                + " within " + SERVER_READY_WAIT_SECONDS + "s.", lastFailure);
     }
 
     /**
@@ -147,21 +184,26 @@ public final class TestSupport {
     }
 
     /**
-     * A wrapper around a server and its port, used for test cleanup.
+     * A wrapper around a server, its manager group and its port, used for test cleanup.
      */
     public static class TestServer implements AutoCloseable {
 
         private final Server server;
-        final int port;
+        private final ManagerGroup managerGroup;
+        /** The port the server is listening on. */
+        public final int port;
 
-        TestServer(Server server, int port) {
+        TestServer(Server server, ManagerGroup managerGroup, int port) {
             this.server = server;
+            this.managerGroup = managerGroup;
             this.port = port;
         }
 
         @Override
         public void close() {
+            // Stop the server first, then tear down the selector/worker threads it used.
             server.close();
+            managerGroup.close();
         }
 
     }

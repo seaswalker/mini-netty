@@ -1,25 +1,25 @@
 package com.github.skywalker.mininetty.selector;
 
+import com.github.skywalker.mininetty.context.FutureAttached;
 import com.github.skywalker.mininetty.handler.Handler;
-import com.github.skywalker.mininetty.handler.HandlerChain;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.SocketChannel;
+import java.nio.channels.*;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import com.github.skywalker.mininetty.manager.ChooseStrategy;
+import com.github.skywalker.mininetty.handler.HandlerChain;
+import com.github.skywalker.mininetty.worker.Worker;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.github.skywalker.mininetty.util.CloseableUtils;
-import com.github.skywalker.mininetty.worker.Worker;
 import com.github.skywalker.mininetty.worker.WorkerManager;
 import com.github.skywalker.mininetty.context.ChannelHandlerContext;
 import com.github.skywalker.mininetty.lifecycle.LifeCycle;
@@ -83,8 +83,30 @@ public final class QueuedSelector implements Runnable, LifeCycle {
     /**
      * Register the channel to the selector with the interested ops.
      */
-    public void register(SocketChannel channel, List<Handler> handlers) {
-        submitTask(new RegisterChannelTask(channel, this, handlers));
+    public Future<?> registerServerChannelAsync(int port, List<Handler> handlers) {
+        CompletableFuture<?> future = new CompletableFuture<>();
+        try {
+            ServerSocketChannel serverSocketChannel = ServerSocketChannel.open();
+            serverSocketChannel.configureBlocking(false);
+            serverSocketChannel.socket().bind(new InetSocketAddress(port));
+            submitTask(new RegisterServerChannelTask(serverSocketChannel, handlers, future));
+        } catch (IOException e) {
+            future.completeExceptionally(e);
+        }
+        return future;
+    }
+
+    public Future<?> registerClientChannelAsync(String host, int port, List<Handler> handlers) {
+        CompletableFuture<?> future = new CompletableFuture<>();
+        try {
+            SocketAddress socketAddress = new InetSocketAddress(host, port);
+            SocketChannel socketChannel = SocketChannel.open();
+            socketChannel.configureBlocking(false);
+            submitTask(new RegisterClientChannelTask(socketChannel, socketAddress, handlers, future));
+        } catch (IOException e) {
+            future.completeExceptionally(e);
+        }
+        return future;
     }
 
     public void addInterestOps(SocketChannel channel, String clientIdentifier, int ops) {
@@ -141,61 +163,108 @@ public final class QueuedSelector implements Runnable, LifeCycle {
         return String.format("queued-selector-%d", threadCounter.getAndIncrement());
     }
 
+    private interface ChannelRegistrationListener {
+        void onRegistered(SelectionKey selectionKey) throws IOException;
+        void onExceptionCaught(Throwable cause);
+    }
+
     /**
-     * Registers a newly accepted channel with the selector and bootstraps its per-connection state:
-     * builds the handler chain, binds the channel to a worker and creates the
-     * {@link ChannelHandlerContext} attached to the selection key.
+     * Registers a channel with the selector.
      */
     private class RegisterChannelTask implements Runnable {
 
-        private final SocketChannel channel;
-        private final QueuedSelector queuedSelector;
-        private final List<Handler> handlers;
+        private final SelectableChannel channel;
+        private final int interestOps;
+        private final ChannelRegistrationListener channelRegistrationListener;
 
-        public RegisterChannelTask(SocketChannel channel, QueuedSelector queuedSelector, List<Handler> handlers) {
+        RegisterChannelTask(SelectableChannel channel, int interestOps, ChannelRegistrationListener channelRegistrationListener) {
             this.channel = channel;
-            this.queuedSelector = queuedSelector;
-            this.handlers = handlers;
+            this.interestOps = interestOps;
+            this.channelRegistrationListener = channelRegistrationListener;
         }
 
         @Override
         public void run() {
-            SelectionKey key = null;
             try {
-                key = channel.register(selector, SelectionKey.OP_READ);
-            } catch (IOException e) {
-                logger.debug("Failed to register key {}.", e.getMessage());
-                try {
-                    channel.close();
-                } catch (IOException ignored) {
-                }
+                SelectionKey key = channel.register(selector, interestOps);
+                channelRegistrationListener.onRegistered(key);
+            } catch (Exception e) {
+                CloseableUtils.closeQuietly(channel);
+                channelRegistrationListener.onExceptionCaught(e);
             }
-
-            if (key == null) {
-                return;
-            }
-
-            HandlerChain handlerChain = new HandlerChain();
-            handlerChain.addHandlers(this.handlers);
-            Worker worker = workerManager.chooseOne(channel, ChooseStrategy.PostAction.BIND);
-
-            ChannelHandlerContext context;
-            try {
-                context = new ChannelHandlerContext(handlerChain, worker, channel, queuedSelector);
-            } catch (IOException e) {
-                logger.debug("Failed to create channel handler context {}.", e.getMessage());
-                key.cancel();
-                try {
-                    channel.close();
-                } catch (IOException ignored) {
-                }
-                return;
-            }
-            key.attach(context);
-
-            context.fireChannelActive();
         }
 
+    }
+
+    private static class PreClientConnectedChannelContext implements FutureAttached {
+        final List<Handler> handlers;
+        final CompletableFuture<?> future;
+        PreClientConnectedChannelContext(List<Handler> handlers, CompletableFuture<?> future) {
+            this.handlers = handlers;
+            this.future = future;
+        }
+        @Override
+        public CompletableFuture<?> getFuture() {
+            return future;
+        }
+    }
+
+    private PreClientConnectedChannelContext createPreClientConnectedChannelContext(List<Handler> handlers, CompletableFuture<?> completableFuture) {
+        return new PreClientConnectedChannelContext(handlers, completableFuture);
+    }
+
+    private class RegisterServerChannelTask extends RegisterChannelTask {
+        RegisterServerChannelTask(ServerSocketChannel serverSocketChannel, List<Handler> handlers, CompletableFuture<?> completableFuture) {
+            super(serverSocketChannel, SelectionKey.OP_ACCEPT, new ChannelRegistrationListener() {
+                @Override
+                public void onRegistered(SelectionKey selectionKey) {
+                    PreClientConnectedChannelContext preClientConnectedChannelContext = createPreClientConnectedChannelContext(handlers, completableFuture);
+                    selectionKey.attach(preClientConnectedChannelContext);
+                    completableFuture.whenComplete((unused, throwable) -> {
+                        if (completableFuture.isCancelled()) {
+                            submitTask(() -> cancelKey(selectionKey, null));
+                        }
+                    });
+                }
+                @Override
+                public void onExceptionCaught(Throwable cause) {
+                    completableFuture.completeExceptionally(cause);
+                }
+            });
+        }
+    }
+
+    private class RegisterClientChannelTask extends RegisterChannelTask {
+        RegisterClientChannelTask(SocketChannel socketChannel, SocketAddress socketAddress, List<Handler> handlers,
+                                  CompletableFuture<?> channelRegisterFuture) {
+            super(socketChannel, SelectionKey.OP_CONNECT, new ChannelRegistrationListener() {
+                @Override
+                public void onRegistered(SelectionKey selectionKey) throws IOException {
+                    PreClientConnectedChannelContext context = new PreClientConnectedChannelContext(handlers, channelRegisterFuture);
+                    selectionKey.attach(context);
+                    socketChannel.connect(socketAddress);
+                    channelRegisterFuture.whenComplete((unused, throwable) -> {
+                        if (channelRegisterFuture.isCancelled()) {
+                            submitTask(() -> cancelKey(selectionKey, null));
+                        }
+                    });
+                }
+                @Override
+                public void onExceptionCaught(Throwable cause) {
+                    channelRegisterFuture.completeExceptionally(cause);
+                }
+            });
+        }
+    }
+
+    private ChannelHandlerContext createSocketChannelContext(SocketChannel socketChannel, List<Handler> handlers,
+                                                             CompletableFuture<?> completableFuture) throws IOException {
+        HandlerChain handlerChain = new HandlerChain();
+        handlerChain.addHandlers(handlers);
+        Worker worker = workerManager.chooseOne();
+        return new ChannelHandlerContext(
+                handlerChain, worker, socketChannel, this, completableFuture
+        );
     }
 
     /**
@@ -205,32 +274,121 @@ public final class QueuedSelector implements Runnable, LifeCycle {
 
         @Override
         public void run() {
+            int i = 0;
             try {
-                int i = selector.select();
-                if (i > 0) {
-                    Set<SelectionKey> keys = selector.selectedKeys();
-                    for (SelectionKey key : keys) {
-                        if (key.isReadable()) {
-                            SocketChannel channel = (SocketChannel) key
-                                    .channel();
-                            ByteBuffer buffer = ByteBuffer
-                                    .allocate(defaultAllocateSize);
-                            int n = channel.read(buffer);
-                            if (n == -1) {
-                                processInActive(key);
-                            } else {
-                                processRead(buffer, key);
-                            }
-                        } else if (key.isWritable()) {
-                            processWrite(key);
-                        }
+                i = selector.select();
+            } catch (IOException e) {
+                logger.warn("Failed to select events from selector.", e);
+            }
+
+            if (i > 0) {
+                Set<SelectionKey> keys = selector.selectedKeys();
+                for (SelectionKey key : keys) {
+                    if (key.isConnectable()) {
+                        processConnectable(key);
+                    } else if (key.isReadable()) {
+                        processReadable(key);
+                    } else if (key.isWritable()) {
+                        processWritable(key);
+                    } else if (key.isAcceptable()) {
+                        processAcceptable(key);
                     }
-                    keys.clear();
+                }
+                keys.clear();
+            }
+        }
+
+        private void processReadable(SelectionKey key) {
+            if (extractFuture(key).isCancelled()) {
+                extractSocketChannelAttachment(key).fireChannelInActive();
+                return;
+            }
+
+            SocketChannel channel = (SocketChannel) key.channel();
+            ByteBuffer buffer = ByteBuffer.allocate(defaultAllocateSize);
+            try {
+                int n = channel.read(buffer);
+                if (n == -1) {
+                    processInActive(key);
+                } else {
+                    fireChannelRead(buffer, key);
                 }
             } catch (IOException e) {
-                logger.debug("Selector was closed.");
-                closed = true;
+                cancelKey(key, e);
             }
+        }
+
+        private void processConnectable(SelectionKey key) {
+            if (extractFuture(key).isCancelled()) {
+                cancelKey(key, null);
+                return;
+            }
+
+            SocketChannel channel = (SocketChannel) key.channel();
+            PreClientConnectedChannelContext preClientConnectedChannelContext = (PreClientConnectedChannelContext) key.attachment();
+
+            try {
+                if (channel.finishConnect()) {
+                    key.interestOps(SelectionKey.OP_READ);
+                    ChannelHandlerContext context = createSocketChannelContext(
+                            channel,
+                            preClientConnectedChannelContext.handlers,
+                            preClientConnectedChannelContext.future
+                    );
+                    key.attach(context);
+                    processActive(key);
+                }
+            } catch (IOException e) {
+                cancelKey(key, e);
+            }
+        }
+
+        private void processAcceptable(SelectionKey key) {
+            if (extractFuture(key).isCancelled()) {
+                cancelKey(key, null);
+                return;
+            }
+
+            ServerSocketChannel serverSocketChannel = (ServerSocketChannel) key.channel();
+            PreClientConnectedChannelContext preClientConnectedChannelContext = (PreClientConnectedChannelContext) key.attachment();
+
+            SocketChannel socketChannel;
+            try {
+               socketChannel = serverSocketChannel.accept();
+            } catch (IOException e) {
+                logger.error("Server failed to accept connection.", e);
+                cancelKey(key, e);
+                return;
+            }
+
+            if (socketChannel == null) {
+                return;
+            }
+
+            String clientIdentifier = null;
+            ChannelHandlerContext context;
+
+            try {
+                socketChannel.configureBlocking(false);
+                clientIdentifier = socketChannel.getRemoteAddress().toString();
+                SelectionKey acceptedKey = socketChannel.register(selector, SelectionKey.OP_READ);
+                context = createSocketChannelContext(socketChannel, preClientConnectedChannelContext.handlers, preClientConnectedChannelContext.future);
+                acceptedKey.attach(context);
+            } catch (IOException e) {
+                logger.warn("Failed to register accepted channel: {}.", clientIdentifier,  e);
+                return;
+            }
+
+            context.fireChannelActive();
+        }
+
+        private void processActive(SelectionKey key) {
+            if (extractFuture(key).isCancelled()) {
+                cancelKey(key, null);
+                return;
+            }
+            ChannelHandlerContext context = (ChannelHandlerContext) key.attachment();
+            context.fireChannelActive();
         }
 
         /**
@@ -241,20 +399,41 @@ public final class QueuedSelector implements Runnable, LifeCycle {
             context.fireChannelInActive();
         }
 
+        private void processWritable(SelectionKey key) {
+            if (extractFuture(key).isCancelled()) {
+                extractSocketChannelAttachment(key).fireChannelInActive();
+                return;
+            }
+            extractSocketChannelAttachment(key).fireChannelWrite();
+        }
+
         /**
          * Handles a read event.
          *
          * @param buffer the bytes read from the channel
          */
-        private void processRead(ByteBuffer buffer, SelectionKey key) {
-            ChannelHandlerContext context = (ChannelHandlerContext) key.attachment();
-            context.fireChannelRead(buffer);
+        private void fireChannelRead(ByteBuffer buffer, SelectionKey key) {
+            extractSocketChannelAttachment(key).fireChannelRead(buffer);
         }
 
-        private void processWrite(SelectionKey key) {
-            ChannelHandlerContext context = (ChannelHandlerContext) key.attachment();
-            context.fireChannelWrite();
+    }
+
+    private static ChannelHandlerContext extractSocketChannelAttachment(SelectionKey key) {
+        return (ChannelHandlerContext) key.attachment();
+    }
+
+    private static CompletableFuture<?> extractFuture(SelectionKey key) {
+        return ((FutureAttached) key.attachment()).getFuture();
+    }
+
+    private static void cancelKey(SelectionKey key, @Nullable Throwable cause) {
+        if (cause != null) {
+            extractFuture(key).completeExceptionally(cause);
+        } else {
+            extractFuture(key).complete(null);
         }
+        key.cancel();
+        CloseableUtils.closeQuietly(key.channel());
     }
 
 }

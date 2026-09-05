@@ -4,9 +4,10 @@
 # netty-wheel
 
 A lightweight, educational re-implementation of a Netty-style network framework built purely on
-Java NIO (`java.nio`). It demonstrates how an event-driven, non-blocking server works under the
-hood - selectors, worker threads, handler pipelines and channel contexts - with no runtime
-dependency on Netty itself.
+Java NIO (`java.nio`). It demonstrates how an event-driven, non-blocking server and client work
+under the hood - selectors, worker threads, handler pipelines and channel contexts - with no
+runtime dependency on Netty itself. The server and every client share one `ManagerGroup`, so a
+whole application runs on a small, fixed set of selector and worker threads.
 
 > Java 8 required. This is a study project, not a production framework.
 
@@ -23,14 +24,16 @@ dependency on Netty itself.
 - Lifecycle and I/O events: `channelActive`, `channelInActive`, `channelRead`, `channelWrite`,
   `channelExceptionCaught`.
 - `HandlerChain`: inbound events flow head to tail, outbound events flow tail back to head.
-- `HandlerInitializer`: the recommended way to register user handlers. Its `init()` method is
-  invoked every time a client connection becomes active, and the returned handlers are spliced
-  into that connection private chain (see Important notes).
+- `HandlerInitializer`: the recommended way to register server-side user handlers. Its `init()`
+  method is invoked every time a connection is accepted, and the returned handlers are spliced
+  into that connection's private chain (see Important notes). Framework `Client`s pass their
+  handler chain directly through `handlers(...)`.
 
 ### Built-in handlers (installed automatically per connection)
 
-Every accepted connection gets a fresh `HandlerChain` that already contains the following
-built-in handlers, so you do not - and should not - register them yourself:
+Every connection - accepted server-side or opened by a framework `Client` - gets a fresh
+`HandlerChain` that already contains the following built-in handlers, so you do not - and should
+not - register them yourself:
 
 | Handler | Type | Responsibility |
 | --- | --- | --- |
@@ -59,17 +62,24 @@ Outbound encoder:
 
 ### Concurrency model
 
-- **Acceptor threads** accept new connections and register each `SocketChannel` with a selector.
-- **SelectorManager** runs NIO selector threads that dispatch readable / writable events.
-- **WorkerManager** picks a worker per connection (round-robin) and **binds** the connection to
-  it, so all events of one connection are executed serially on a single worker thread.
+- **`ManagerGroup` is the shared unit of thread resources.** It bundles a `SelectorManager` (N
+  selector threads) and a `WorkerManager` (M worker threads). One group can back any number of
+  `Server`s and `Client`s at the same time: every connection - accepted server-side or opened by
+  a framework `Client` - runs on the group's threads, never on per-connection threads. Defaults
+  are 1 selector and one worker per CPU core; `new ManagerGroup(selectorCount, workerCount)`
+  overrides them.
+- **Selector threads** (`QueuedSelector`) accept new connections and dispatch readable / writable
+  events.
+- **Worker threads** are assigned round-robin per connection and **bind** the connection to
+  themselves, so all events of one connection are executed serially on a single worker thread.
 - Each connection owns an independent `ChannelHandlerContext`, `HandlerChain`, decoder state and
   outbound write queue. State is never shared between clients.
 
 ### Idle detection
 
-- Each connection is checked periodically. When no read or write happens within the idle timeout
-  (default **5 seconds**), the server logs a message and actively closes the channel.
+- Every connection is checked periodically - on the server side and on a framework `Client`
+  alike. When no read or write happens within the idle timeout (default **5 seconds**), the
+  framework logs a message and actively closes the channel.
 - Any read or write refreshes `lastActiveTime` via `IdleDetectionDuplexHandler`, so heartbeats or
   regular traffic keep the connection alive.
 
@@ -84,115 +94,170 @@ Outbound encoder:
 
 ## Thread model
 
-A connection flows through three tiers of threads and is then permanently bound to one worker,
-so its handler chain always executes on the same thread:
+All I/O threads live inside one `ManagerGroup`. A group is created per application, started once
+and shared by the `Server` and every `Client`: accepted connections and client channels alike
+bind onto the group's threads, so the total thread count never grows with the number of
+connections. A connection flows through the selector tier and is then permanently bound to one
+worker, so its handler chain always executes on the same thread:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Acceptor threads  (fixed pool)                               │
-│ · blocking accept() loop                                     │
-│ · new SocketChannel -> choose one                            │
-│   QueuedSelector (round-robin)                               │
-│ · submit 'register channel' into its                         │
-│   per-thread task queue                                      │
-└──────────────────────────────┴───────────────────────────────┘
-                               │
-                               ▼ register(channel)
-┌──────────────────────────────┬───────────────────────────────┐
-│ QueuedSelector threads  (queued-selector-*)                  │
-│ · own java.nio.Selector + task queue                         │
-│ · select() dispatch:                                         │
-│     OP_READ  -> read socket,                                 │
-│                 hand bytes to bound worker                   │
-│     OP_WRITE -> ask worker to drain writes                   │
-└──────────────────────────────┴───────────────────────────────┘
-                               │ bind connection
-                               ▼ (round-robin)
-┌──────────────────────────────┬───────────────────────────────┐
-│ Worker threads  (mini-netty-worker-*)                        │
-│ · 1 connection is permanently bound to                       │
-│   1 worker -> events run serially,                           │
-│   no locks needed                                            │
-│ · executes the per-connection chain:                         │
-│    decoder -> user handler -> encoder                        │
-│ · drains pending writes, applies back-pressure               │
-│ · scheduled tasks: idle detection (5 s)                      │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ ManagerGroup  (shared by the Server and every Client)            │
+│                                                                  │
+│  SelectorManager    (queued-selector-*)                          │
+│  · N QueuedSelector threads, each owns a java.nio.Selector and   │
+│    a per-thread task queue (interest-op changes never race the   │
+│    select loop)                                                  │
+│  · registers channels and accepts connections; select() dispatch:│
+│      OP_READ    -> read the socket, hand bytes to the            │
+│                    connection's bound worker                     │
+│      OP_WRITE   -> ask the bound worker to drain writes          │
+│                            │ bind connection (round-robin)       │
+│                            ▼                                    │
+│  WorkerManager    (mini-netty-worker-*)                          │
+│  · M worker threads; 1 connection is permanently bound to        │
+│    1 worker -> events run serially, no locks needed              │
+│  · executes the per-connection chain:                            │
+│      decoder -> user handler -> encoder                          │
+│  · drains pending writes, applies back-pressure                  │
+│  · scheduled tasks: idle detection (5 s)                         │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-* **Acceptor** - the blocking `accept()` loop. Each accepted `SocketChannel` is registered on
-  one of the `QueuedSelector`s (round-robin) by submitting a task into its queue.
+* **`ManagerGroup`** - the shared pool of selector and worker threads. Start it once and reuse
+  it for the server and all clients; `group.close()` stops the whole group. Defaults are 1
+  selector and one worker per CPU core; `new ManagerGroup(selectorCount, workerCount)` overrides
+  them.
 * **QueuedSelector** - performs the real NIO `select()`. Each thread owns its own
-  `java.nio.Selector` and a task queue, so interest-op changes never race the select loop. On
+  `java.nio.Selector` and a task queue, so interest-op changes never race the select loop. It
+  registers channels and accepts new connections itself - there is no separate acceptor pool. On
   `OP_READ` it reads the socket and hands the bytes to the connection's bound worker; on
   `OP_WRITE` it asks that worker to drain the pending write queue.
 * **Worker** - the connection's event loop. Because a connection is permanently bound to exactly
   one worker, all of its channel events run serially on that thread and need no locks. Scheduled
   tasks (e.g. idle detection) run here too.
 
-Thread counts are auto-sized from the number of available CPU cores; pass explicit counts with
-`new Server(acceptors, workers)` to override them.
-
 ## Getting started
 
 ### 1. Boot a server
 
 ```java
-Server server = new Server();
-server.bind(8080).setHandlers(new HandlerInitializer() {
-    @Override
-    public Handler[] init() {
-        return new Handler[] {
-            new LengthFieldBasedDecoder(0, 4),  // first 4 bytes hold the frame length
-            new StringDecoder(),
-            new MyHandler()
-        };
-    }
-}).start();
+// One ManagerGroup holds the shared I/O threads; defaults: 1 selector + one worker per CPU core.
+ManagerGroup group = new ManagerGroup();
+group.start();
+
+Server server = new Server(group)
+        .bind(8080)
+        .setHandlers(new HandlerInitializer() {
+            @Override
+            public Handler[] init() {
+                return new Handler[] {
+                    new DelimiterBasedDecoder((byte) '\n'),  // frames end with '\n'
+                    new StringDecoder(),
+                    new EchoHandler()
+                };
+            }
+        });
+server.startAsync();   // returns as soon as the server is listening
 ```
 
-Call `server.close()` to stop the server.
+A `Server` is always built on a started `ManagerGroup`. `startAsync()` registers the listening
+channel and returns immediately; `start()` instead blocks the calling thread until the server is
+closed. Call `server.close()` to stop it.
 
-### 2. Write a handler
+### 2. Write handlers
+
+Server side - reply to each decoded request:
 
 ```java
-public class MyHandler extends InBoundHandlerAdapter {
+public class EchoHandler extends InBoundHandlerAdapter {
     @Override
     public void channelRead(Object message, MessageProcessingContext context) {
         // message has already been decoded to a String by the previous handler
         String request = (String) message;
-        context.channel().writeAndFlush(echo(request));
+        context.channel().writeAndFlush("echo: " + request + "\n");
     }
 }
 ```
 
-To reply to a client, call `context.channel().writeAndFlush(...)`. The outbound handlers
-(e.g. `StringEncoder`) and finally `DefaultOutBoundHandler` process the message;
-`String`, `byte[]` and `ByteBuffer` are all supported out of the box.
+Client side - hold the connection and react to replies:
 
-### 3. Test with a raw client socket
+```java
+public class ClientHandler extends InBoundHandlerAdapter {
+    private volatile ChannelHandlerContext channel;   // captured when the connection opens
+
+    @Override
+    public void channelActive(MessageProcessingContext context) {
+        this.channel = context.channel();
+    }
+
+    @Override
+    public void channelRead(Object message, MessageProcessingContext context) {
+        System.out.println("reply: " + message);      // already decoded by the client chain
+    }
+
+    /** Thread-safe: the write is handed over to the connection's worker. */
+    public void send(String line) {
+        channel.writeAndFlush(line + "\n");
+    }
+}
+```
+
+`context.channel().writeAndFlush(...)` walks the outbound handlers (e.g. `StringEncoder`) and
+finally `DefaultOutBoundHandler`; `String`, `byte[]` and `ByteBuffer` are all supported, and the
+call is safe from any thread.
+
+### 3. Connect with a framework `Client`
+
+A `Client` connects to a remote host and runs a handler pipeline on its own connection. Give it
+the **same `ManagerGroup` as the server**, so both share one pool of selector and worker threads:
+
+```java
+ClientHandler clientHandler = new ClientHandler();
+Client client = new Client("localhost", 8080)
+        .setManagerGroup(group)                            // reuse the shared I/O threads
+        .handlers(new DelimiterBasedDecoder((byte) '\n'),   // decode the server frames
+                  new StringDecoder(),
+                  clientHandler);
+client.startAsync();                                       // connect; returns immediately
+
+clientHandler.send("hello");                               // write from any thread
+// ... the reply arrives in ClientHandler.channelRead ...
+
+client.close();                                            // close this connection
+server.close();
+group.close();                                             // release all shared I/O threads
+```
+
+Both `setManagerGroup` and `handlers` are required (`handlers` takes at least one handler). The
+`Future` returned by `startAsync()` completes when the connection ends - peer close, idle timeout
+or `close()` - while `start()` blocks the calling thread until then. The client chain is fully
+application-supplied: attach whatever decoders the remote side speaks, and since a `Client`
+backs exactly one connection, its handler instances are never shared with another connection.
+
+### 4. Test with a raw client socket
+
+A quick sanity check that does not need the framework `Client`:
 
 ```java
 try (Socket socket = new Socket()) {
     socket.connect(new InetSocketAddress("localhost", 8080));
     OutputStream out = socket.getOutputStream();
-    byte[] frame = new byte[4 + body.length];
-    System.arraycopy(DataUtils.int2Bytes(body.length), 0, frame, 0, 4);
-    System.arraycopy(body, 0, frame, 4, body.length);
-    out.write(frame);
+    out.write("hello\n".getBytes(StandardCharsets.UTF_8));
     out.flush();
 }
 ```
 
-### 4. Run the tests
+### 5. Run the tests
 
 ```bash
 mvn test                          # full suite
-mvn -Dtest=com.github.skywalker.mininetty.client.ClientTest test # integration tests against real sockets
+mvn -Dtest=com.github.skywalker.mininetty.client.FrameworkClientTest test  # framework Client <-> framework Server
+mvn -Dtest=com.github.skywalker.mininetty.client.ClientTest test           # raw-socket integration tests
 ```
 
-Performance tests (see `com.github.skywalker.mininetty.client.PerformanceTest`) support a configurable number of concurrent
-clients, payload size and timing window:
+Performance tests (see `com.github.skywalker.mininetty.client.PerformanceTest`) support a
+configurable number of concurrent clients, payload size and timing window:
 
 ```bash
 mvn -Dtest=com.github.skywalker.mininetty.client.PerformanceTest -Dperf.clients=3 -Dperf.duration=10000 test
@@ -237,7 +302,7 @@ Settings: 32-byte payload, 2,000 warm-up round trips (JIT), 5 s measurement wind
    Wrong - the same decoder instance is reused by every connection:
 
    ```java
-   DelimiterBasedDecoder shared = new DelimiterBasedDecoder('\n');
+   DelimiterBasedDecoder shared = new DelimiterBasedDecoder((byte) '\n');
    server.setHandlers(shared, new StringDecoder(), new ResponseHandler());
    ```
 
@@ -248,7 +313,7 @@ Settings: 32-byte payload, 2,000 warm-up round trips (JIT), 5 s measurement wind
        @Override
        public Handler[] init() {
            return new Handler[] {
-               new DelimiterBasedDecoder('\n'),
+               new DelimiterBasedDecoder((byte) '\n'),
                new StringDecoder(),
                new ResponseHandler()
            };
@@ -275,19 +340,7 @@ Settings: 32-byte payload, 2,000 warm-up round trips (JIT), 5 s measurement wind
 5. **Idle timeout.** The default is 5 seconds per connection. Send heartbeats more frequently
    than the timeout if you need longer-lived idle connections.
 
-## Limitations / TODO
-
-### Planned
-
-- [ ] **More reasonable default thread counts.** Thread counts are currently auto-sized with a
-      coarse formula based on CPU cores. Make the defaults follow common practice (e.g. a single
-      acceptor and `2 * cores` workers) and easier to override.
-- [ ] **Configuration via a config file.** Runtime knobs such as the idle timeout (hard-coded to
-      5 s), thread counts, buffer sizes and the write back-pressure threshold should be loadable
-      from a config file instead of source-level constants.
-- [ ] **Client mode.** Provide a reusable client API that connects to a remote host and runs the
-      same handler pipeline on the client side. Today the client helpers exist only in the test
-      sources.
+## Limitations
 
 ### Known limitations
 

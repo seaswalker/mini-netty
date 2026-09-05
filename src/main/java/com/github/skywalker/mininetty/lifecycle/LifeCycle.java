@@ -1,5 +1,9 @@
 package com.github.skywalker.mininetty.lifecycle;
 
+import org.jspecify.annotations.Nullable;
+
+import java.util.concurrent.Future;
+
 /**
  * The lifecycle of a component.
  *
@@ -13,5 +17,15 @@ public interface LifeCycle {
     void start();
 
     void close();
+
+    default @Nullable Future<?> startAsync() {
+        throw new UnsupportedOperationException();
+    }
+
+    enum State {
+        INIT,
+        STARTED,
+        CLOSED
+    }
 
 }

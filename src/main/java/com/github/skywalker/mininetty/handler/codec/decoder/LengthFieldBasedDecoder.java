@@ -76,43 +76,41 @@ public class LengthFieldBasedDecoder extends InBoundHandlerAdapter {
                     process(buffer, 0, out);
                     break;
                 case HEAD_NEEDED:
-                    // Complete the buffered head with the new bytes
-                    if (remaining < needed) {
+                    // Complete the buffered head with the new bytes.
+                    int take = Math.min(remaining, needed);
+                    System.arraycopy(buffer.array(), 0, todo, neededOffset, take);
+                    neededOffset += take;
+                    needed -= take;
+                    remaining -= take;
+                    if (needed > 0) {
                         // Still not enough for a full head
-                        System.arraycopy(buffer.array(), 0, todo, neededOffset, remaining);
-                        neededOffset += remaining;
-                    } else if (remaining == needed) {
-                        System.arraycopy(buffer.array(), 0, todo, neededOffset, remaining);
+                        break;
+                    }
+                    // The head is complete now and todo[0, dataOffset) holds the whole head.
+                    int contentLength = parseAndCheckContentLength();
+                    byte[] arr = new byte[dataOffset + contentLength];
+                    System.arraycopy(todo, 0, arr, 0, dataOffset);
+                    if (remaining < contentLength) {
+                        // Some content has arrived, but not all of it
+                        System.arraycopy(buffer.array(), take, arr, dataOffset, remaining);
                         state = State.CONTENT_NEEDED;
-                        int contentLength = parseAndCheckContentLength();
-                        byte[] arr = new byte[dataOffset + contentLength];
-                        System.arraycopy(todo, 0, arr, 0, dataOffset);
                         todo = arr;
-                        needed = contentLength;
-                        neededOffset = dataOffset;
+                        needed = contentLength - remaining;
+                        neededOffset = dataOffset + remaining;
+                    } else if (remaining == contentLength) {
+                        System.arraycopy(buffer.array(), take, arr, dataOffset, contentLength);
+                        state = State.INIT;
+                        needed = 0;
+                        todo = null;
+                        out.add(arr);
                     } else {
-                        System.arraycopy(buffer.array(), 0, todo, neededOffset, remaining);
-                        int contentLength = parseAndCheckContentLength();
-                        byte[] arr = new byte[dataOffset + contentLength];
-                        System.arraycopy(todo, 0, arr, 0, dataOffset);
-                        remaining -= dataOffset;
-                        if (remaining < contentLength) {
-                            System.arraycopy(buffer.array(), needed, arr, dataOffset, remaining);
-                            state = State.CONTENT_NEEDED;
-                            todo = arr;
-                            needed = contentLength - remaining;
-                            neededOffset = remaining;
-                        } else if (remaining == contentLength) {
-                            System.arraycopy(buffer.array(), needed, arr, dataOffset, remaining);
-                            out.add(arr);
-                            todo = null;
-                            state = State.INIT;
-                        } else {
-                            System.arraycopy(buffer.array(), needed, arr, dataOffset, contentLength);
-                            out.add(arr);
-                            todo = null;
-                            process(buffer, needed + contentLength, out);
-                        }
+                        // More than one full frame arrived in this read
+                        System.arraycopy(buffer.array(), take, arr, dataOffset, contentLength);
+                        state = State.INIT;
+                        needed = 0;
+                        todo = null;
+                        out.add(arr);
+                        process(buffer, take + contentLength, out);
                     }
                     break;
                 case CONTENT_NEEDED:
