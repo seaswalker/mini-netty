@@ -26,12 +26,12 @@ whole application runs on a small, fixed set of selector and worker threads.
 - `HandlerChain`: inbound events flow head to tail, outbound events flow tail back to head.
 - `HandlerInitializer`: the recommended way to register server-side user handlers. Its `init()`
   method is invoked every time a connection is accepted, and the returned handlers are spliced
-  into that connection's private chain (see Important notes). Framework `Client`s pass their
-  handler chain directly through `handlers(...)`.
+  into that connection's private chain (see Important notes). The `Client` side has no
+  `HandlerInitializer`: you pass its handler chain directly through `handlers(...)`.
 
 ### Built-in handlers (installed automatically per connection)
 
-Every connection - accepted server-side or opened by a framework `Client` - gets a fresh
+Every connection - whether accepted by a `Server` or opened by a `Client` - gets a fresh
 `HandlerChain` that already contains the following built-in handlers, so you do not - and should
 not - register them yourself:
 
@@ -64,8 +64,8 @@ Outbound encoder:
 
 - **`ManagerGroup` is the shared unit of thread resources.** It bundles a `SelectorManager` (N
   selector threads) and a `WorkerManager` (M worker threads). One group can back any number of
-  `Server`s and `Client`s at the same time: every connection - accepted server-side or opened by
-  a framework `Client` - runs on the group's threads, never on per-connection threads. Defaults
+  `Server`s and `Client`s at the same time: every connection - whether accepted by a `Server` or
+  opened by a `Client` - runs on the group's threads, never on per-connection threads. Defaults
   are 1 selector and one worker per CPU core; `new ManagerGroup(selectorCount, workerCount)`
   overrides them.
 - **Selector threads** (`QueuedSelector`) accept new connections and dispatch readable / writable
@@ -77,8 +77,8 @@ Outbound encoder:
 
 ### Idle detection
 
-- Every connection is checked periodically - on the server side and on a framework `Client`
-  alike. When no read or write happens within the idle timeout (default **5 seconds**), the
+- Every connection is checked periodically - whether accepted by a `Server` or opened by a
+  `Client`. When no read or write happens within the idle timeout (default **5 seconds**), the
   framework logs a message and actively closes the channel.
 - Any read or write refreshes `lastActiveTime` via `IdleDetectionDuplexHandler`, so heartbeats or
   regular traffic keep the connection alive.
@@ -207,10 +207,11 @@ public class ClientHandler extends InBoundHandlerAdapter {
 finally `DefaultOutBoundHandler`; `String`, `byte[]` and `ByteBuffer` are all supported, and the
 call is safe from any thread.
 
-### 3. Connect with a framework `Client`
+### 3. Connect with a `Client`
 
-A `Client` connects to a remote host and runs a handler pipeline on its own connection. Give it
-the **same `ManagerGroup` as the server**, so both share one pool of selector and worker threads:
+The framework ships a `Client` class for connecting to a remote host and running a handler
+pipeline on its own connection. Give it the **same `ManagerGroup` as the server**, so both share
+one pool of selector and worker threads:
 
 ```java
 ClientHandler clientHandler = new ClientHandler();
@@ -237,7 +238,7 @@ backs exactly one connection, its handler instances are never shared with anothe
 
 ### 4. Test with a raw client socket
 
-A quick sanity check that does not need the framework `Client`:
+A quick sanity check with a plain `java.net.Socket`, i.e. without the `Client` class:
 
 ```java
 try (Socket socket = new Socket()) {
@@ -252,7 +253,7 @@ try (Socket socket = new Socket()) {
 
 ```bash
 mvn test                          # full suite
-mvn -Dtest=com.github.skywalker.mininetty.client.FrameworkClientTest test  # framework Client <-> framework Server
+mvn -Dtest=com.github.skywalker.mininetty.client.FrameworkClientTest test  # Client <-> Server end to end
 mvn -Dtest=com.github.skywalker.mininetty.client.ClientTest test           # raw-socket integration tests
 ```
 
